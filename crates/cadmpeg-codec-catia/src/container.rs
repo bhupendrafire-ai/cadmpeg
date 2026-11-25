@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Modified from upstream cadmpeg v0.6.12 (Apache-2.0 §4(b)): refine V5_CFV2 document
-// kind classification and expose read-only outer stream accessors.
+// kind classification, expose read-only outer stream accessors, and decode CATPrtCont
+// body metadata (names, visibility, and container ownership).
 //! `V5_CFV2` container parsing and logical-stream reconstruction.
 //!
 //! A `CATPart` begins with `V5_CFV2\0` and a big-endian outer directory
@@ -14,6 +15,7 @@
 //! [`crate::variant::Variant`]. [`summarize`] converts the scan into the
 //! container view returned by codec inspection.
 
+pub(crate) mod body_metadata;
 pub(crate) mod body_selection;
 
 use cadmpeg_core::decode::{index_from_u32, u64_from_index};
