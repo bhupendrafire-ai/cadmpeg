@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+// Modified from upstream cadmpeg v0.6.12 (Apache-2.0 §4(b)): support caller-supplied
+// FILE_DESCRIPTION entries in StepWriteOptions.
 //! Writer targets and header metadata.
 //!
 //! These configure *how* a target is written. Which target is written is the
@@ -37,6 +39,10 @@ pub struct StepWriteOptions {
     pub timestamp: Option<String>,
     /// The `FILE_NAME` originating-system field.
     pub originating_system: String,
+    /// Entries written to the `FILE_DESCRIPTION` header record.
+    ///
+    /// When empty, defaults to `["CAD model exported by cadmpeg"]`.
+    pub file_description: Vec<String>,
 }
 
 impl Default for StepWriteOptions {
@@ -47,6 +53,7 @@ impl Default for StepWriteOptions {
             organization: String::new(),
             timestamp: None,
             originating_system: "cadmpeg".to_string(),
+            file_description: Vec::new(),
         }
     }
 }
