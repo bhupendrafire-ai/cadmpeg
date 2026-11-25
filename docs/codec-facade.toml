@@ -10,10 +10,15 @@
 [[crate]]
 id = "catia"
 names = [
+    "CatiaBodyContainerKind",
+    "CatiaBodyMetadata",
     "CatiaCodec",
+    "CatiaPrtContBody",
     "V5DocumentKind",
     "V5OuterStreamView",
     "classify_v5_document",
+    "decode_v5_body_metadata",
+    "decode_v5_prtcont_bodies",
 ]
 fuzz = "required"
 
