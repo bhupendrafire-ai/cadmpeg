@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+// Modified from upstream cadmpeg v0.6.12 (Apache-2.0 §4(b)): export V5_CFV2 document
+// classifier and read-only outer stream accessors.
 //! Reads CATIA V5 `.CATPart` files into [`cadmpeg_ir::CadIr`].
 //!
 //! [`CatiaCodec`] is the normal public decode API. A hidden `fuzz` module
@@ -100,6 +102,8 @@ use cadmpeg_ir::ContainerSummary;
 /// The CATIA V5 `.CATPart` codec.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CatiaCodec;
+
+pub use container::{classify_v5_document, V5DocumentKind, V5OuterStreamView};
 
 impl CodecBackend for CatiaCodec {
     const FORMAT: FormatId = FormatId::new(dialect::FORMAT);
