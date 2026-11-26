@@ -873,10 +873,11 @@ where
                     continuing_run.then(|| {
                         parse_consolidated_allocation_record(data, phys_pos, range.end).filter(
                             |rec| {
-                                WidthCodedToken::new(rec.width(), rec.header_token())
-                                    .ok()
-                                    .and_then(WidthCodedToken::compact_operand)
-                                    .is_some()
+                                rec.flag() == ConsolidatedFrameFlag::Flag03
+                                    && WidthCodedToken::new(rec.width(), rec.header_token())
+                                        .ok()
+                                        .and_then(WidthCodedToken::compact_operand)
+                                        .is_some()
                             },
                         )
                     })?
@@ -1582,7 +1583,7 @@ mod width_token_admission_tests {
         // Record 1: B5 (width 4, token 0x00_01_00_0c -> compact 3-byte u24 increment 0x00_01_00 = 256), empty payload.
         // Record 2: B2 (width 1, token 0x05 -> increment 1), empty payload.
         let bytes = [
-            0xb2, 0x03, 0x24, 0x00, 0x05, 0xb5, 0x13, 0x5b, 0x00, 0x0c, 0x00, 0x01, 0x00, 0xb2,
+            0xb2, 0x03, 0x24, 0x00, 0x05, 0xb5, 0x03, 0x20, 0x00, 0x0c, 0x00, 0x01, 0x00, 0xb2,
             0x03, 0x5f, 0x00, 0x05,
         ];
         let records = super::consolidated_records(&bytes);
