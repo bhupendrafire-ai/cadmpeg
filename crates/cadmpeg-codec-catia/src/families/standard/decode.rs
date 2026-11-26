@@ -2177,6 +2177,7 @@ fn try_decode_standard_population(
     let mut plane_normals = standard_plane_normals_from_face_frames(&records, &face_frame_vectors);
     crate::families::freeform::standard_carriers::recover_missing_plane_normals(
         &scan.data,
+        &sources,
         &consolidated_records,
         brep,
         &records,
@@ -2827,6 +2828,7 @@ fn try_decode_standard_population(
             &mut ir,
             &mut annotations,
             &scan.data,
+            &sources,
             &consolidated_records,
             &a5_carriers,
             refusal,
