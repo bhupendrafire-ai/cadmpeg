@@ -283,6 +283,10 @@ impl<'a> CarrierResolver<'a> {
                     .into_iter()
                     .next()
                     .map(|surface| SolvedSurfaceGeometry::Nurbs(surface.geometry))
+                })
+                .or_else(|| {
+                    decode_u32_nurbs_surface(self.data, carrier, refusal)
+                        .map(SolvedSurfaceGeometry::Nurbs)
                 }),
             (ConsolidatedFamily::B, 0x27) => decode_b2_plane(self.data, carrier, self.b2_planes)
                 .map(SolvedSurfaceGeometry::Plane),
@@ -1055,6 +1059,198 @@ fn decode_uncompressed_axis_mask_plane(bytes: &[u8]) -> Option<PlaneSurface> {
     ))
 }
 
+/// Decode an uncompressed `u32le`-header class-`0x34` NURBS surface (`A_34`).
+///
+/// Each axis carries `(degree: u32le, distinct_count: u32le)`, a knot marker
+/// (`0x04`, or `0x00` + `u32le` flag), strictly increasing `f64le` knots, and
+/// a multiplicity mode (`0x01` standard, or `0x00` explicit `u32le` vector).
+/// Follows with `[mode: u16le]` (`0` polynomial, `1` rational with inline
+/// `f64le` weights), `u_count * v_count` poles, and a `>= 152`-byte tail
+/// carrying `[u_lo, u_hi, v_lo, v_hi]` (`u16le`), the 8-scalar chart block with
+/// identity affine map `[1.0, 0.0, 1.0, 0.0]`, and terminal `fe ff fe ff`.
+fn decode_u32_nurbs_surface(
+    data: &[u8],
+    record: &ConsolidatedRecord,
+    refusal: &mut crate::nurbs::LaneRefusals,
+) -> Option<NurbsSurface> {
+    if record.family() != ConsolidatedFamily::A || record.class() != 0x34 {
+        return None;
+    }
+    let payload = record.payload().and_then(|range| data.get(range))?;
+    let mut view = View::over_retained(payload);
+    let (u_degree, u_knots, u_count) = read_u32_nurbs_axis(&mut view)?;
+    let (v_degree, v_knots, v_count) = read_u32_nurbs_axis(&mut view)?;
+    let mode = [view.u8()?, view.u8()?];
+    let rational = match mode {
+        [0x00, 0x00] => false,
+        [0x01, 0x00] => true,
+        _ => return None,
+    };
+    let poles = crate::nurbs_surface_control_count(u_count, v_count)?;
+    let pole_bytes = poles.checked_mul(24)?;
+    let weight_bytes = if rational { poles.checked_mul(8)? } else { 0 };
+    if pole_bytes.checked_add(weight_bytes)?.checked_add(152)? > view.remaining() {
+        return None;
+    }
+    let mut raw_points = Vec::with_capacity(poles);
+    for _ in 0..poles {
+        let x = view.f64_le()?;
+        let y = view.f64_le()?;
+        let z = view.f64_le()?;
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            return None;
+        }
+        raw_points.push(Point3::new(x, y, z));
+    }
+    let raw_weights = if rational {
+        let mut weights = Vec::with_capacity(poles);
+        for _ in 0..poles {
+            let weight = view.f64_le()?;
+            if !weight.is_finite() || weight <= 0.0 {
+                return None;
+            }
+            weights.push(weight);
+        }
+        Some(weights)
+    } else {
+        None
+    };
+    let tail = view.take(view.remaining())?;
+    if tail.len() < 152 || tail.get(tail.len() - 4..) != Some(&[0xfe, 0xff, 0xfe, 0xff]) {
+        return None;
+    }
+    let mut tail_view = View::over_retained(tail);
+    let u_lo = tail_view.u16_le()?;
+    let u_hi = tail_view.u16_le()?;
+    let v_lo = tail_view.u16_le()?;
+    let v_hi = tail_view.u16_le()?;
+    if u_lo != 1 || v_lo != 1 || u_hi == 0 || v_hi == 0 {
+        return None;
+    }
+    let mut parameters = [0.0_f64; 8];
+    for slot in &mut parameters {
+        let value = tail_view.f64_le()?;
+        if !value.is_finite() {
+            return None;
+        }
+        *slot = value;
+    }
+    if parameters[4..] != [1.0, 0.0, 1.0, 0.0] {
+        return None;
+    }
+    let grid = if let Some(weights) = raw_weights {
+        let mut rows = Vec::with_capacity(u_count);
+        for u in 0..u_count {
+            let mut row = Vec::with_capacity(v_count);
+            for v in 0..v_count {
+                let idx = u * v_count + v;
+                row.push(cadmpeg_ir::geometry::nurbs::WeightedPole3 {
+                    point: raw_points[idx],
+                    weight: cadmpeg_ir::scalar::NonZeroReal::new(weights[idx])?,
+                });
+            }
+            rows.push(row);
+        }
+        NurbsPoleGrid::Rational { rows }
+    } else {
+        let mut rows = Vec::with_capacity(u_count);
+        for u in 0..u_count {
+            let start = u * v_count;
+            rows.push(raw_points[start..start + v_count].to_vec());
+        }
+        NurbsPoleGrid::Polynomial { rows }
+    };
+    crate::nurbs::note_refusal(
+        NurbsSurface::new(
+            NurbsSurfaceAxis::new(u_degree, u_knots, false),
+            NurbsSurfaceAxis::new(v_degree, v_knots, false),
+            grid,
+            false,
+        ),
+        refusal,
+        format_args!(
+            "u32le A_34 NURBS surface record at byte {}",
+            record.byte_offset()
+        ),
+    )
+}
+
+fn read_u32_nurbs_axis(view: &mut View<'_>) -> Option<(u32, Vec<f64>, usize)> {
+    let degree = view.u32_le()?;
+    let distinct_count = usize::try_from(view.u32_le()?).ok()?;
+    if !(1..=64).contains(&degree)
+        || distinct_count < 2
+        || distinct_count.checked_mul(8)? > view.remaining()
+    {
+        return None;
+    }
+    match view.u8()? {
+        0x04 => {}
+        0x00 => {
+            let _flag = view.u32_le()?;
+        }
+        _ => return None,
+    }
+    let mut distinct = Vec::with_capacity(distinct_count);
+    for _ in 0..distinct_count {
+        let knot = view.f64_le()?;
+        if !knot.is_finite() {
+            return None;
+        }
+        distinct.push(knot);
+    }
+    if !cadmpeg_ir::geometry::nurbs::knots_strictly_increasing(&distinct) {
+        return None;
+    }
+    let deg_usize = usize::try_from(degree).ok()?;
+    let multiplicities: Vec<usize> = match view.u8()? {
+        0x01 => {
+            let interior = match degree {
+                _ if distinct_count == 2 => 1usize,
+                1..=3 => 1usize,
+                5 => 3usize,
+                _ => return None,
+            };
+            (0..distinct_count)
+                .map(|index| {
+                    if index == 0 || index + 1 == distinct_count {
+                        deg_usize + 1
+                    } else {
+                        interior
+                    }
+                })
+                .collect()
+        }
+        0x00 => {
+            if distinct_count.checked_mul(4)? > view.remaining() {
+                return None;
+            }
+            let mut mults = Vec::with_capacity(distinct_count);
+            for _ in 0..distinct_count {
+                let mult = usize::try_from(view.u32_le()?).ok()?;
+                if mult == 0 || mult > deg_usize + 1 {
+                    return None;
+                }
+                mults.push(mult);
+            }
+            mults
+        }
+        _ => return None,
+    };
+    let total_knots = multiplicities
+        .iter()
+        .try_fold(0usize, |acc, &m| acc.checked_add(m))?;
+    let pole_count = total_knots.checked_sub(deg_usize.checked_add(1)?)?;
+    if pole_count <= deg_usize {
+        return None;
+    }
+    let mut knots = Vec::with_capacity(total_knots);
+    for (&knot, &mult) in distinct.iter().zip(&multiplicities) {
+        knots.extend(std::iter::repeat_n(knot, mult));
+    }
+    Some((degree, knots, pole_count))
+}
+
 /// General bitmask decoder for `b2 03 27` plane payloads.
 ///
 /// Bounded planes use `(layout & 0x8f) == 0x84` with `mask`:
@@ -1430,5 +1626,68 @@ mod tests {
         assert!(n.x.abs() < TOL);
         assert!((n.y - 0.8).abs() < TOL);
         assert!((n.z - 0.6).abs() < TOL);
+    }
+
+    #[test]
+    fn u32_a34_decodes_polynomial_rational_and_explicit_multiplicity_surfaces() {
+        // Build a degree (1, 1) rational 2x2 u32le A_34 surface with explicit V multiplicities.
+        let mut payload = Vec::new();
+        // U axis: deg=1, distinct=2, marker=0x04, knots=[0.0, 10.0], mult_mode=0x01
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&2_u32.to_le_bytes());
+        payload.push(0x04);
+        for k in [0.0_f64, 10.0] {
+            payload.extend_from_slice(&k.to_le_bytes());
+        }
+        payload.push(0x01);
+        // V axis: deg=1, distinct=2, marker=0x00 + flag 2, knots=[0.0, 5.0], mult_mode=0x00, mults=[2, 2]
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&2_u32.to_le_bytes());
+        payload.push(0x00);
+        payload.extend_from_slice(&2_u32.to_le_bytes());
+        for k in [0.0_f64, 5.0] {
+            payload.extend_from_slice(&k.to_le_bytes());
+        }
+        payload.push(0x00);
+        payload.extend_from_slice(&2_u32.to_le_bytes());
+        payload.extend_from_slice(&2_u32.to_le_bytes());
+        // Mode: rational [1, 0]
+        payload.extend_from_slice(&[0x01, 0x00]);
+        for p in [
+            [0.0_f64, 0.0, 0.0],
+            [0.0, 5.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.0, 5.0, 1.0],
+        ] {
+            for c in p {
+                payload.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        for w in [1.0_f64, 1.0, 1.0, 1.0] {
+            payload.extend_from_slice(&w.to_le_bytes());
+        }
+        // 152-byte tail: [1,1,1,1] u16 + [0,10,0,5,1,0,1,0] f64 + 76 zero bytes + fe ff fe ff
+        for h in [1_u16, 1, 1, 1] {
+            payload.extend_from_slice(&h.to_le_bytes());
+        }
+        for v in [0.0_f64, 10.0, 0.0, 5.0, 1.0, 0.0, 1.0, 0.0] {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        payload.extend_from_slice(&[0x00; 76]);
+        payload.extend_from_slice(&[0xfe, 0xff, 0xfe, 0xff]);
+
+        let mut frame = vec![0xa5, 0x03, 0x34];
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        frame.push(0x05);
+        frame.extend_from_slice(&payload);
+        let records = crate::wire::records::consolidated_records(&frame);
+        let mut refusal = crate::nurbs::LaneRefusals::new();
+        let surf = super::decode_u32_nurbs_surface(&frame, &records[0], &mut refusal)
+            .expect("decoded u32le A_34 surface");
+        assert_eq!(surf.u_degree(), 1);
+        assert_eq!(surf.v_degree(), 1);
+        assert_eq!(surf.u_count(), 2);
+        assert_eq!(surf.v_count(), 2);
+        assert!(refusal.take_notes().is_empty());
     }
 }

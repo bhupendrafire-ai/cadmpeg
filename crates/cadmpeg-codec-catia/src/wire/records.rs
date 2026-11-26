@@ -795,14 +795,26 @@ where
                 source_ranges.push(range);
             }
         }
-        let mut source_records = Vec::new();
+        let mut source_records: Vec<ConsolidatedRecord> = Vec::new();
         let mut source_offset = 0usize;
         for range in &source_ranges {
             let start = range.start;
             let end = range.end;
             let mut pos = start;
             while pos < end {
-                let Some(mut record) = parse_consolidated_record(data, pos, end) else {
+                let continuing_run = source_records
+                    .last()
+                    .is_some_and(|prev| prev.range().is_some_and(|range| range.end == pos));
+                let Some(mut record) = parse_consolidated_record(data, pos, end).or_else(|| {
+                    continuing_run.then(|| {
+                        parse_consolidated_allocation_record(data, pos, end).filter(|rec| {
+                            WidthCodedToken::new(rec.width(), rec.header_token())
+                                .ok()
+                                .and_then(WidthCodedToken::compact_operand)
+                                .is_some()
+                        })
+                    })?
+                }) else {
                     pos += 1;
                     continue;
                 };
@@ -896,10 +908,14 @@ fn parse_spanning_consolidated_record(
         None
     };
     let first = source_byte(source_start)?;
-    let (family, width, header_len, length) = if let Some(width) = first
-        .checked_sub(0xa4)
-        .and_then(ConsolidatedFrameWidth::from_byte)
-    {
+    let (family, width, header_len, length) = if let Some(width) =
+        first.checked_sub(0xa4).and_then(|raw| {
+            if raw == 4 {
+                Some(ConsolidatedFrameWidth::Four)
+            } else {
+                ConsolidatedFrameWidth::from_byte(raw)
+            }
+        }) {
         let length_bytes = [
             source_byte(source_start.checked_add(3)?)?,
             source_byte(source_start.checked_add(4)?)?,
@@ -910,9 +926,10 @@ fn parse_spanning_consolidated_record(
             View::u32_le_at(&length_bytes, 0).and_then(|value| usize::try_from(value).ok())?;
         (ConsolidatedFamily::A, width, a_frame::LEN, length)
     } else {
-        let width = first
-            .checked_sub(0xb1)
-            .and_then(ConsolidatedFrameWidth::from_byte)?;
+        let width = match first {
+            0xb5 => ConsolidatedFrameWidth::Four,
+            marker => ConsolidatedFrameWidth::from_byte(marker.checked_sub(0xb1)?)?,
+        };
         (
             ConsolidatedFamily::B,
             width,
@@ -956,12 +973,16 @@ fn parse_spanning_consolidated_record(
             None
         }
     })?;
+    let token = WidthCodedToken::new(width, header_token).ok()?;
+    if width == ConsolidatedFrameWidth::Four && token.compact_operand().is_none() {
+        return None;
+    }
     Some(ConsolidatedRecord {
         source_index,
         source_range: source_start..source_end,
         placement: ConsolidatedPlacement::Spanning { byte_offset },
         family,
-        token: WidthCodedToken::new(width, header_token).ok()?,
+        token,
         flag,
         class,
     })
@@ -1511,5 +1532,23 @@ mod width_token_admission_tests {
             assert_eq!(record.header_token(), maximum);
             assert!(super::WidthCodedToken::new(width, maximum + 1).is_err());
         }
+    }
+
+    #[test]
+    fn width_four_allocation_record_continues_contiguous_journal() {
+        // Record 0: B2 (width 1, token 0x05 -> increment 1), empty payload.
+        // Record 1: B5 (width 4, token 0x00_01_00_0c -> compact 3-byte u24 increment 0x00_01_00 = 256), empty payload.
+        // Record 2: B2 (width 1, token 0x05 -> increment 1), empty payload.
+        let bytes = [
+            0xb2, 0x03, 0x24, 0x00, 0x05, 0xb5, 0x13, 0x5b, 0x00, 0x0c, 0x00, 0x01, 0x00, 0xb2,
+            0x03, 0x5f, 0x00, 0x05,
+        ];
+        let records = super::consolidated_records(&bytes);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].width(), super::ConsolidatedFrameWidth::Four);
+        let journal = crate::families::consolidated::allocation::AllocationJournal::new(&records);
+        assert_eq!(journal.absolute_address(0), Some(1));
+        assert_eq!(journal.absolute_address(1), Some(257));
+        assert_eq!(journal.absolute_address(2), Some(258));
     }
 }
