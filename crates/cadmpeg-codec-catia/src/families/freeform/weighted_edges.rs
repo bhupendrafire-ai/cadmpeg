@@ -554,6 +554,13 @@ fn lift_pcurve_with_chart(
     Ok(fitted)
 }
 
+fn unique_matching_coedge(matching: &[usize]) -> Option<usize> {
+    match matching {
+        [only] => Some(*only),
+        _ => None,
+    }
+}
+
 #[inline(never)]
 fn build_general_lifted_plan(
     env: &LiftedPlanContext<'_>,
@@ -621,7 +628,7 @@ fn build_general_lifted_plan(
                         })
                 })
                 .collect();
-            (matching.len() == 1).then_some(matching[0])
+            unique_matching_coedge(&matching)
         });
         let face_surface = coedge_index
             .and_then(|ci| loop_faces.get(&ir.geometry.coedges[ci].owner_loop))
@@ -1897,7 +1904,14 @@ mod tests {
     use crate::wire::bytes::AllocationReferenceEncoding;
     use crate::wire::records::consolidated_records;
 
-    use super::{curve_record, endpoint_matches};
+    use super::{curve_record, endpoint_matches, unique_matching_coedge};
+
+    #[test]
+    fn unique_matching_coedge_returns_none_when_empty_or_ambiguous() {
+        assert_eq!(unique_matching_coedge(&[]), None);
+        assert_eq!(unique_matching_coedge(&[7]), Some(7));
+        assert_eq!(unique_matching_coedge(&[7, 9]), None);
+    }
 
     #[test]
     fn endpoint_match_uses_the_stored_binary32_cell_or_declared_tolerance() {
