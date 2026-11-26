@@ -628,15 +628,16 @@ pub(in crate::families) fn extrude_nurbs_curve(
 }
 
 /// Decode a `u32le`-header class-`0x21` 2D B-spline pcurve (`A_21` or `B_21`).
-pub(in crate::families) fn decode_u32_bspline_pcurve(
+pub(super) fn decode_u32_bspline_pcurve_in_sources(
     data: &[u8],
+    sources: &[Vec<SourceExtent>],
     record: &ConsolidatedRecord,
 ) -> Option<(AllocationReference, PcurveNurbs, [f64; 2])> {
     if record.class() != 0x21 {
         return None;
     }
-    let payload = record.payload().and_then(|range| data.get(range))?;
-    decode_u32_bspline_pcurve_payload(payload)
+    let payload = record.payload_bytes(data, sources)?;
+    decode_u32_bspline_pcurve_payload(&payload)
 }
 
 fn decode_u32_bspline_pcurve_payload(
@@ -698,16 +699,17 @@ fn decode_u32_bspline_pcurve_payload(
 }
 
 /// Decode a `u32le`-header class-`0x20` quintic UV jet pcurve (`A_20` or `B_20`).
-pub(in crate::families) fn decode_u32_jet_pcurve(
+pub(super) fn decode_u32_jet_pcurve_in_sources(
     data: &[u8],
+    sources: &[Vec<SourceExtent>],
     record: &ConsolidatedRecord,
     refusal: &mut crate::nurbs::LaneRefusals,
 ) -> Option<(AllocationReference, PcurveGeometry, [f64; 2])> {
     if record.class() != 0x20 {
         return None;
     }
-    let payload = record.payload().and_then(|range| data.get(range))?;
-    decode_u32_jet_pcurve_payload(payload, refusal)
+    let payload = record.payload_bytes(data, sources)?;
+    decode_u32_jet_pcurve_payload(&payload, refusal)
 }
 
 fn decode_u32_jet_pcurve_payload(
@@ -944,15 +946,7 @@ fn resolve_b2_plane<'a>(
     }
 }
 
-pub(super) fn decode_b2_plane(
-    data: &[u8],
-    record: &ConsolidatedRecord,
-    b2_planes: &HashMap<usize, crate::families::b2::records::B2PlaneCarrier>,
-) -> Option<PlaneSurface> {
-    decode_b2_plane_in_sources(data, &[], record, b2_planes)
-}
-
-fn decode_b2_plane_in_sources(
+pub(super) fn decode_b2_plane_in_sources(
     data: &[u8],
     sources: &[Vec<SourceExtent>],
     record: &ConsolidatedRecord,
@@ -1087,19 +1081,25 @@ fn decode_compact_nurbs_curve(
 }
 
 /// Decode an uncompressed `b2 03 27` plane carrier storing a 24-byte `f64le`
-/// origin, a 1-byte `0xc0 | zero_mask` axis bitmask (`ux, uy, uz, vx, vy, vz`
-/// in bits `0..6`), and only the non-zero `f64le` axis components.
+/// origin, a 1-byte axis bitmask (`0xc0 | zero_mask` unbounded, or `0x40 |
+/// zero_mask` followed by 4 trailing `f64le` UV bounds), and only the non-zero
+/// `f64le` axis components (`ux, uy, uz, vx, vy, vz` in bits `0..6`).
 fn decode_uncompressed_axis_mask_plane(bytes: &[u8]) -> Option<PlaneSurface> {
     if bytes.len() < 25 {
         return None;
     }
     let mask = bytes[24];
-    if (mask & 0xc0) != 0xc0 {
-        return None;
-    }
+    let has_bounds = match mask & 0xc0 {
+        0xc0 => false,
+        0x40 => true,
+        _ => return None,
+    };
     let zero_mask = mask & 0x3f;
     let stored_components = 6usize.checked_sub(usize::try_from(zero_mask.count_ones()).ok()?)?;
-    let expected_len = 25usize.checked_add(stored_components.checked_mul(8)?)?;
+    let bounds_bytes = if has_bounds { 32usize } else { 0usize };
+    let expected_len = 25usize
+        .checked_add(stored_components.checked_mul(8)?)?
+        .checked_add(bounds_bytes)?;
     if bytes.len() != expected_len {
         return None;
     }
@@ -1114,6 +1114,13 @@ fn decode_uncompressed_axis_mask_plane(bytes: &[u8]) -> Option<PlaneSurface> {
                 return None;
             }
             *slot = value;
+        }
+    }
+    if has_bounds {
+        for _ in 0..4 {
+            if !view.f64_le()?.is_finite() {
+                return None;
+            }
         }
     }
     if !view.is_empty() {
@@ -1136,7 +1143,7 @@ fn decode_uncompressed_axis_mask_plane(bytes: &[u8]) -> Option<PlaneSurface> {
 /// `f64le` weights), `u_count * v_count` poles, and a `>= 152`-byte tail
 /// carrying `[u_lo, u_hi, v_lo, v_hi]` (`u16le`), the 8-scalar chart block with
 /// identity affine map `[1.0, 0.0, 1.0, 0.0]`, and terminal `fe ff fe ff`.
-fn decode_u32_nurbs_surface(
+pub(super) fn decode_u32_nurbs_surface(
     data: &[u8],
     sources: &[Vec<SourceExtent>],
     record: &ConsolidatedRecord,
@@ -1443,17 +1450,17 @@ pub(in crate::families) fn resolve_ref<'a>(
         AllocationReferenceEncoding::BackwardDistance | AllocationReferenceEncoding::WidthCoded => {
             journal.resolve_weighted_distance(origin, reference.value)
         }
-        AllocationReferenceEncoding::OwnedChild => journal.resolve_address(
+        AllocationReferenceEncoding::OwnedChild
+        | AllocationReferenceEncoding::TaggedU8
+        | AllocationReferenceEncoding::TaggedU16
+        | AllocationReferenceEncoding::TaggedU24 => journal.resolve_address(
             origin,
             journal
                 .address(origin)?
                 .checked_add(u64::from(reference.value))?
                 .checked_add(1)?,
         ),
-        AllocationReferenceEncoding::Selector2
-        | AllocationReferenceEncoding::TaggedU8
-        | AllocationReferenceEncoding::TaggedU16
-        | AllocationReferenceEncoding::TaggedU24 => None,
+        AllocationReferenceEncoding::Selector2 => None,
     }
 }
 
@@ -1531,7 +1538,8 @@ mod tests {
         let records = crate::wire::records::consolidated_records(&frame);
         assert_eq!(records.len(), 1);
         let (support_ref, nurbs, range) =
-            super::decode_u32_bspline_pcurve(&frame, &records[0]).expect("decoded 0x21 pcurve");
+            super::decode_u32_bspline_pcurve_in_sources(&frame, &[], &records[0])
+                .expect("decoded 0x21 pcurve");
         assert_eq!(support_ref.value, 1);
         assert_eq!(nurbs.degree(), 5);
         assert_eq!(nurbs.control_points().len(), 6);
@@ -1696,6 +1704,23 @@ mod tests {
         assert!(n.x.abs() < TOL);
         assert!((n.y - 0.8).abs() < TOL);
         assert!((n.z - 0.6).abs() < TOL);
+
+        // Bounded 105-byte plane (mask 0x40: all 6 axis components + 4 UV bounds).
+        let mut bounded = full.clone();
+        bounded[24] = 0x40;
+        for b in [0.0_f64, 100.0, 0.0, 50.0] {
+            bounded.extend_from_slice(&b.to_le_bytes());
+        }
+        assert_eq!(bounded.len(), 105);
+        let plane3 = super::decode_uncompressed_axis_mask_plane(&bounded).expect("105-byte plane");
+        assert!(
+            plane3
+                .origin()
+                .get()
+                .distance(Point3::new(10.0, 20.0, 30.0))
+                < TOL
+        );
+        assert!((plane3.frame().axis().as_raw().z - 1.0).abs() < TOL);
     }
 
     #[test]
@@ -1792,7 +1817,7 @@ mod tests {
         let records = crate::wire::records::consolidated_records(&frame);
         let mut refusal = crate::nurbs::LaneRefusals::new();
         let (support_ref, _pcurve, range) =
-            super::decode_u32_jet_pcurve(&frame, &records[0], &mut refusal)
+            super::decode_u32_jet_pcurve_in_sources(&frame, &[], &records[0], &mut refusal)
                 .expect("decoded u32le 0x20 quintic jet pcurve");
         assert_eq!(support_ref.value, 1);
         assert!((range[0] - 0.0).abs() < TOL);

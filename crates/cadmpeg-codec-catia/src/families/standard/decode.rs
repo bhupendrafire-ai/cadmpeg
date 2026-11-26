@@ -2872,6 +2872,7 @@ fn try_decode_standard_population(
         &mut ir,
         &mut annotations,
         &scan.data,
+        &sources,
         &consolidated_records,
         &a5_carriers,
         refusal,
