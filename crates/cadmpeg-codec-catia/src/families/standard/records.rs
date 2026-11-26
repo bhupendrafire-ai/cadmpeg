@@ -555,14 +555,8 @@ pub(super) fn face_sense(brep: &[u8], prefix: &SurfacePrefix) -> Option<bool> {
     }
 }
 
-/// Read the unique contiguous standard vertex roster with the requested
-/// cardinality. Each seven-byte row stores `54 <identity:u24le> 00 00 00`;
-/// roster order is coordinate-table order.
-pub(super) fn standard_vertex_roster(source: &[u8], vertex_count: usize) -> Option<Vec<u32>> {
-    if vertex_count == 0 {
-        return None;
-    }
-    let mut solutions = Vec::new();
+fn all_standard_vertex_rosters(source: &[u8]) -> Vec<Vec<u32>> {
+    let mut rosters = Vec::new();
     let mut position = 0usize;
     while position + vertex_roster::LEN <= source.len() {
         if source[position + vertex_roster::MARKER] != 0x54
@@ -579,7 +573,9 @@ pub(super) fn standard_vertex_roster(source: &[u8], vertex_count: usize) -> Opti
             && source[position + vertex_roster::ZERO_RUN + 1..position + vertex_roster::LEN]
                 == [0, 0]
         {
-            let identity = View::u32_le_at(source, position + vertex_roster::TAG)?;
+            let Some(identity) = View::u32_le_at(source, position + vertex_roster::TAG) else {
+                break;
+            };
             if identities
                 .last()
                 .is_some_and(|previous| *previous >= identity)
@@ -589,16 +585,74 @@ pub(super) fn standard_vertex_roster(source: &[u8], vertex_count: usize) -> Opti
             identities.push(identity);
             position += vertex_roster::LEN;
         }
-        if identities.len() == vertex_count {
-            solutions.push(identities);
+        if !identities.is_empty() {
+            rosters.push(identities);
         }
         if position == start {
             position += 1;
         }
     }
+    rosters
+}
+
+/// Read the unique contiguous standard vertex roster with the requested
+/// cardinality. Each seven-byte row stores `54 <identity:u32le> 00 00`;
+/// roster order is coordinate-table order.
+pub(super) fn standard_vertex_roster(source: &[u8], vertex_count: usize) -> Option<Vec<u32>> {
+    if vertex_count == 0 {
+        return None;
+    }
+    let solutions: Vec<Vec<u32>> = all_standard_vertex_rosters(source)
+        .into_iter()
+        .filter(|identities| identities.len() == vertex_count)
+        .collect();
     <[Vec<u32>; 1]>::try_from(solutions)
         .ok()
         .map(|[identities]| identities)
+}
+
+/// Pair source-ordered vertex rosters with source-ordered population vertex
+/// counts. When the filtered sequence of candidate rosters matches `counts`
+/// positionally 1-to-1, each population receives its positional roster even
+/// when multiple populations share a vertex count; otherwise each population
+/// falls back to unique-count matching.
+pub(super) fn pair_standard_vertex_rosters(
+    source: &[u8],
+    counts: &[usize],
+) -> Vec<Option<Vec<u32>>> {
+    if counts.is_empty() {
+        return Vec::new();
+    }
+    let wanted: HashSet<usize> = counts.iter().copied().filter(|&count| count > 0).collect();
+    let matched: Vec<Vec<u32>> = all_standard_vertex_rosters(source)
+        .into_iter()
+        .filter(|roster| wanted.contains(&roster.len()))
+        .collect();
+    if matched.len() == counts.len()
+        && matched
+            .iter()
+            .zip(counts)
+            .all(|(roster, &count)| roster.len() == count)
+    {
+        return matched.into_iter().map(Some).collect();
+    }
+    let mut unique_by_len = HashMap::<usize, Option<Vec<u32>>>::new();
+    for roster in matched {
+        unique_by_len
+            .entry(roster.len())
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(roster));
+    }
+    counts
+        .iter()
+        .map(|&count| {
+            if count == 0 {
+                None
+            } else {
+                unique_by_len.get(&count).cloned().flatten()
+            }
+        })
+        .collect()
 }
 
 /// Locate complete analytic surface records by the strict 5-byte template
@@ -1269,6 +1323,26 @@ mod tests {
         assert_eq!(
             super::standard_vertex_roster(&roster, 2),
             Some(vec![0x016f_6017, 0x016f_6018])
+        );
+    }
+
+    #[test]
+    fn pair_standard_vertex_rosters_matches_repeated_counts_in_source_order() {
+        let mut bytes = Vec::new();
+        for run in [vec![10u32, 11], vec![20u32, 21]] {
+            for tag in run {
+                bytes.push(0x54);
+                bytes.extend_from_slice(&tag.to_le_bytes());
+                bytes.extend_from_slice(&[0, 0]);
+            }
+            bytes.push(0xff);
+        }
+        // Single-count lookup withholds repeated cardinality.
+        assert_eq!(super::standard_vertex_roster(&bytes, 2), None);
+        // Positional multi-population pairing binds both rosters cleanly.
+        assert_eq!(
+            super::pair_standard_vertex_rosters(&bytes, &[2, 2]),
+            vec![Some(vec![10, 11]), Some(vec![20, 21])]
         );
     }
 }

@@ -1621,7 +1621,7 @@ struct StandardPopulationSelection {
     records: Vec<StandardSurfaceRecord>,
     supports: Vec<crate::families::standard::records::StandardCurveSupport>,
     edge_table_form: EdgeTableForm,
-    vertex_roster_compatible: bool,
+    vertex_roster: Option<Vec<u32>>,
     body_metadata: Option<crate::container::body_metadata::CatiaBodyMetadata>,
 }
 
@@ -1647,18 +1647,27 @@ fn standard_population_selections(
         return Ok(None);
     };
     let mut fbb_starts = Vec::with_capacity(1 + pairs.rest.len());
+    let mut vertex_counts = Vec::with_capacity(1 + pairs.rest.len());
     fbb_starts.push(pairs.first.0.face_run.face_start());
+    vertex_counts.push(pairs.first.0.vertex_count);
     for (layout, _) in &pairs.rest {
         fbb_starts.push(layout.face_run.face_start());
+        vertex_counts.push(layout.vertex_count);
     }
     let mut resolved_metadata =
         crate::container::body_metadata::resolve_standard_populations(scan, &fbb_starts)
             .into_iter();
+    let mut paired_rosters = crate::families::standard::records::pair_standard_vertex_rosters(
+        &scan.data,
+        &vertex_counts,
+    )
+    .into_iter();
     let select = |(layout, population): (
         fbb::FbbPopulationLayout,
         crate::families::standard::records::StandardSurfacePopulation,
     ),
-                  body_metadata: Option<crate::container::body_metadata::CatiaBodyMetadata>|
+                  body_metadata: Option<crate::container::body_metadata::CatiaBodyMetadata>,
+                  vertex_roster: Option<Vec<u32>>|
      -> Result<Option<StandardPopulationSelection>, CodecError> {
         let Some(spine) = fbb::population_spine(standard_spine, &layout) else {
             return Ok(None);
@@ -1668,20 +1677,26 @@ fn standard_population_selections(
             records: population.records,
             supports: population.supports,
             edge_table_form: layout.edge_table_form,
-            vertex_roster_compatible: crate::families::standard::records::standard_vertex_roster(
-                &scan.data,
-                layout.vertex_count,
-            )
-            .is_some(),
+            vertex_roster,
             body_metadata,
         }))
     };
-    let Some(first) = select(pairs.first, resolved_metadata.next().flatten())? else {
+    let Some(first) = select(
+        pairs.first,
+        resolved_metadata.next().flatten(),
+        paired_rosters.next().flatten(),
+    )?
+    else {
         return Ok(None);
     };
     let mut rest = Vec::new();
     for pair in pairs.rest {
-        let Some(selection) = select(pair, resolved_metadata.next().flatten())? else {
+        let Some(selection) = select(
+            pair,
+            resolved_metadata.next().flatten(),
+            paired_rosters.next().flatten(),
+        )?
+        else {
             return Ok(None);
         };
         rest.push(selection);
@@ -2065,10 +2080,9 @@ fn try_decode_standard_population(
         },
     };
     let points = vertex_points.unwrap_or_default();
-    let vertex_roster = if selection.is_none_or(|selection| selection.vertex_roster_compatible) {
-        crate::families::standard::records::standard_vertex_roster(&scan.data, points.len())
-    } else {
-        None
+    let vertex_roster = match selection {
+        Some(selection) => selection.vertex_roster.clone(),
+        None => crate::families::standard::records::standard_vertex_roster(&scan.data, points.len()),
     };
     let face_count = if let Some(selection) = selection {
         selection.records.len()
@@ -2676,7 +2690,7 @@ fn try_decode_standard_population(
     let topology_budget = cadmpeg_core::decode::WorkBudget::new(mesh_quotient::MAX_MESH_TOPOLOGY_OPERATIONS);
     #[cfg(test)]
     let topology_budget = cadmpeg_core::decode::WorkBudget::new(crate::test_support::standard_topology_limit());
-    let topology_result = attach_standard_topology(ctx, crate::families::standard::decode::AttachStandardTopologyInputs { ir: &mut topology_ir, annotations: &mut topology_annotations, bindings: &face_bindings, records: &records, face_bounds: &face_bounds, spine: standard_spine, edge_table_form, brep, support_override: selection.map(|selection| selection.supports.as_slice()), source: &scan.data, e5_record_range: scan.e5_record_range.clone(), use_vertex_roster: selection.is_none_or(|selection| selection.vertex_roster_compatible), native_edge_faces: &object_evidence.edge_owner_faces, native_edge_supports: &object_evidence.edge_supports, limit_curves: &object_evidence.limit_curves, work_budget: &topology_budget, diagnostics: &mut topology_diagnostics, bound_limit_curve_count: &mut bound_standard_limit_curve_count, refusal, admission: &mut admission })
+    let topology_result = attach_standard_topology(ctx, crate::families::standard::decode::AttachStandardTopologyInputs { ir: &mut topology_ir, annotations: &mut topology_annotations, bindings: &face_bindings, records: &records, face_bounds: &face_bounds, spine: standard_spine, edge_table_form, brep, support_override: selection.map(|selection| selection.supports.as_slice()), source: &scan.data, e5_record_range: scan.e5_record_range.clone(), vertex_roster: vertex_roster.as_deref(), native_edge_faces: &object_evidence.edge_owner_faces, native_edge_supports: &object_evidence.edge_supports, limit_curves: &object_evidence.limit_curves, work_budget: &topology_budget, diagnostics: &mut topology_diagnostics, bound_limit_curve_count: &mut bound_standard_limit_curve_count, refusal, admission: &mut admission })
     .and_then(|()| {
         neutral_model_is_admissible(ctx, &mut topology_ir, &unknowns).map_err(StandardTopologyError::Codec)?
             .then_some(())
@@ -4670,7 +4684,7 @@ struct AttachStandardTopologyInputs<
     support_override: Option<&'input7 [crate::families::standard::records::StandardCurveSupport]>,
     source: &'input8 [u8],
     e5_record_range: Option<std::ops::Range<usize>>,
-    use_vertex_roster: bool,
+    vertex_roster: Option<&'input7 [u32]>,
     native_edge_faces: &'input9 HashMap<u32, HashSet<u32>>,
     native_edge_supports: &'input10 HashMap<u32, StandardEdgeSupport>,
     limit_curves: &'input11 [NurbsCurve],
@@ -4718,7 +4732,7 @@ fn attach_standard_topology(
         support_override,
         source,
         e5_record_range,
-        use_vertex_roster,
+        vertex_roster,
         native_edge_faces,
         native_edge_supports,
         limit_curves,
@@ -4929,16 +4943,9 @@ fn attach_standard_topology(
         native_ports.push(pair);
     }
     let native_ports = all_ports.then_some(native_ports);
-    let vertex_roster = if use_vertex_roster {
-        crate::families::standard::records::standard_vertex_roster(source, ir.geometry.points.len())
-    } else {
-        None
-    };
-    let allocation_endpoint_points = vertex_roster
-        .as_ref()
-        .map(|roster| standard_successor_endpoint_points(&supports, roster));
+    let allocation_endpoint_points =
+        vertex_roster.map(|roster| standard_successor_endpoint_points(&supports, roster));
     let roster_endpoint_pairs = vertex_roster
-        .as_ref()
         .and_then(|roster| standard_serialized_endpoint_pairs(&supports, &native_edges, roster));
     let mut native_support_ids = HashSet::new();
     for id in native_edge_supports.keys().copied() {
