@@ -1291,8 +1291,11 @@ fn parse_trim_chain_with_length_encoding(
 
     let prefix = bytes.get(..end)?;
     let mut predecessors = HashMap::<usize, Vec<usize>>::new();
-    for (start, marker) in prefix.windows(2).enumerate() {
-        if marker[0] != 0x01 || !TRIM_KINDS.contains(&marker[1]) {
+    for start in memchr::memchr_iter(0x01, prefix) {
+        let Some(&kind) = prefix.get(start + 1) else {
+            continue;
+        };
+        if !TRIM_KINDS.contains(&kind) {
             continue;
         }
         if let Some(layout) =
@@ -1305,6 +1308,7 @@ fn parse_trim_chain_with_length_encoding(
 
     let mut solutions = Vec::new();
     let mut reversed = Vec::<TrimRecord>::new();
+    let mut dead_states = HashSet::<(usize, usize)>::new();
 
     let mut frames = Vec::new();
     frames.push(Frame {
@@ -1312,6 +1316,7 @@ fn parse_trim_chain_with_length_encoding(
         remaining: record_count,
         next_predecessor: 0,
     });
+    let mut frame_had_solution = vec![false];
     while !frames.is_empty() && solutions.len() <= 1 {
         let frame = frames.len() - 1;
         if frames[frame].remaining == 0 {
@@ -1327,7 +1332,11 @@ fn parse_trim_chain_with_length_encoding(
             }
             records.reverse();
             solutions.push((chain_start, records));
+            for solved in &mut frame_had_solution {
+                *solved = true;
+            }
             backtrack(&mut frames, &mut reversed);
+            frame_had_solution.pop();
             continue;
         }
         let predecessor = predecessors
@@ -1335,21 +1344,29 @@ fn parse_trim_chain_with_length_encoding(
             .and_then(|records| records.get(frames[frame].next_predecessor))
             .copied();
         let Some(start) = predecessor else {
+            let solved = frame_had_solution.pop().unwrap_or(false);
+            if !solved {
+                dead_states.insert((frames[frame].end, frames[frame].remaining));
+            }
             backtrack(&mut frames, &mut reversed);
             continue;
         };
         frames[frame].next_predecessor += 1;
+        let remaining = frames[frame].remaining - 1;
+        if dead_states.contains(&(start, remaining)) {
+            continue;
+        }
         let Some(record) = parse_trim_record_with_length_encoding(prefix, start, width, wide_u16be)
         else {
             continue;
         };
-        let remaining = frames[frame].remaining - 1;
         reversed.push(record);
         frames.push(Frame {
             end: start,
             remaining,
             next_predecessor: 0,
         });
+        frame_had_solution.push(false);
     }
     <[(usize, Vec<TrimRecord>); 1]>::try_from(solutions)
         .ok()
