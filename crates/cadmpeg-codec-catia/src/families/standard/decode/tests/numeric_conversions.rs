@@ -51,6 +51,7 @@ fn visualization_refuses_coordinate(coordinate: f64, axis: usize) -> bool {
                 source: &[],
                 e5_record_range: None,
                 vertex_roster: None,
+                consolidated_edge_vertices: &std::collections::BTreeMap::new(),
                 native_edge_faces: &HashMap::new(),
                 native_edge_supports: &HashMap::new(),
                 limit_curves: &[],

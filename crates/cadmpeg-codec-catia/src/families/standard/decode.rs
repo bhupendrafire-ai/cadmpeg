@@ -2732,7 +2732,13 @@ fn try_decode_standard_population(
     let topology_budget = cadmpeg_core::decode::WorkBudget::new(mesh_quotient::MAX_MESH_TOPOLOGY_OPERATIONS);
     #[cfg(test)]
     let topology_budget = cadmpeg_core::decode::WorkBudget::new(crate::test_support::standard_topology_limit());
-    let topology_result = attach_standard_topology(ctx, crate::families::standard::decode::AttachStandardTopologyInputs { ir: &mut topology_ir, annotations: &mut topology_annotations, bindings: &face_bindings, records: &records, face_bounds: &face_bounds, spine: standard_spine, edge_table_form, brep, support_override: selection.map(|selection| selection.supports.as_slice()), source: &scan.data, e5_record_range: scan.e5_record_range.clone(), vertex_roster: vertex_roster.as_deref(), native_edge_faces: &object_evidence.edge_owner_faces, native_edge_supports: &object_evidence.edge_supports, limit_curves: &object_evidence.limit_curves, work_budget: &topology_budget, diagnostics: &mut topology_diagnostics, bound_limit_curve_count: &mut bound_standard_limit_curve_count, refusal, admission: &mut admission })
+    let consolidated_edge_vertices =
+        crate::families::consolidated::allocation::consolidated_edge_vertex_references(
+            &scan.data,
+            &sources,
+            &consolidated_records,
+        );
+    let topology_result = attach_standard_topology(ctx, crate::families::standard::decode::AttachStandardTopologyInputs { ir: &mut topology_ir, annotations: &mut topology_annotations, bindings: &face_bindings, records: &records, face_bounds: &face_bounds, spine: standard_spine, edge_table_form, brep, support_override: selection.map(|selection| selection.supports.as_slice()), source: &scan.data, e5_record_range: scan.e5_record_range.clone(), vertex_roster: vertex_roster.as_deref(), consolidated_edge_vertices: &consolidated_edge_vertices, native_edge_faces: &object_evidence.edge_owner_faces, native_edge_supports: &object_evidence.edge_supports, limit_curves: &object_evidence.limit_curves, work_budget: &topology_budget, diagnostics: &mut topology_diagnostics, bound_limit_curve_count: &mut bound_standard_limit_curve_count, refusal, admission: &mut admission })
     .and_then(|()| {
         neutral_model_is_admissible(ctx, &mut topology_ir, &unknowns).map_err(StandardTopologyError::Codec)?
             .then_some(())
@@ -4729,6 +4735,7 @@ struct AttachStandardTopologyInputs<
     source: &'input8 [u8],
     e5_record_range: Option<std::ops::Range<usize>>,
     vertex_roster: Option<&'input7 [u32]>,
+    consolidated_edge_vertices: &'input9 BTreeMap<u32, [u32; 2]>,
     native_edge_faces: &'input9 HashMap<u32, HashSet<u32>>,
     native_edge_supports: &'input10 HashMap<u32, StandardEdgeSupport>,
     limit_curves: &'input11 [NurbsCurve],
@@ -4777,6 +4784,7 @@ fn attach_standard_topology(
         source: inputs.source,
         e5_record_range: inputs.e5_record_range.clone(),
         vertex_roster: inputs.vertex_roster,
+        consolidated_edge_vertices: inputs.consolidated_edge_vertices,
         native_edge_faces: inputs.native_edge_faces,
         native_edge_supports: inputs.native_edge_supports,
         limit_curves: inputs.limit_curves,
@@ -4846,6 +4854,7 @@ fn attach_standard_topology_inner(
             source,
             e5_record_range,
             vertex_roster,
+            consolidated_edge_vertices,
             native_edge_faces,
             native_edge_supports,
             limit_curves,
@@ -5180,6 +5189,9 @@ fn attach_standard_topology_inner(
             if !merge_standard_edge_vertex_references(&mut native_edges, e5_edges) {
                 return Err(StandardTopologyFailure::ConflictingNativeEndpoints.into());
             }
+        }
+        for (&edge, &vertices) in consolidated_edge_vertices {
+            native_edges.entry(edge).or_insert(vertices);
         }
         let graph_endpoint_pairs = standard_native_graph_endpoint_pairs(
             topology_graph.as_ref(),
