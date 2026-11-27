@@ -80,10 +80,7 @@ fn nist_ftc_07_transfers_every_solid_face_carrier() {
         .iter()
         .filter(|loss| loss.code.local_code() == "geometry.conic-branch-bounds-inferred")
         .collect();
-    assert_eq!(inferences.len(), 28);
-    assert!(inferences
-        .iter()
-        .all(|loss| loss.message.contains("stored-box excess")));
+    assert!(inferences.is_empty());
 }
 
 #[test]
