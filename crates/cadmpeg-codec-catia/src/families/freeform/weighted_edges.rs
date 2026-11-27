@@ -351,6 +351,8 @@ struct LiftedPlanContext<'a> {
     sources: &'a [Vec<SourceExtent>],
     journal: &'a AllocationJournal<'a>,
     a5_by_pos: &'a HashMap<usize, &'a cadmpeg_ir::geometry::nurbs::NurbsSurface>,
+    a5_multi_extent_cache:
+        &'a std::cell::RefCell<HashMap<usize, Option<cadmpeg_ir::geometry::nurbs::NurbsSurface>>>,
     jets: &'a HashMap<usize, crate::wire::records::ConsolidatedPcurve>,
     planes: &'a HashMap<usize, crate::families::b2::records::B2PlaneCarrier>,
     cylinders: &'a HashMap<usize, crate::families::b2::records::B2Cylinder>,
@@ -385,34 +387,45 @@ fn resolve_support_surface_and_chart<'a>(
         {
             match (support_rec.family(), support_rec.class()) {
                 (ConsolidatedFamily::A, 0x34) => {
-                    if let Some(nurbs) = env.a5_by_pos.get(&support_rec.byte_offset()) {
+                    let pos = support_rec.byte_offset();
+                    if let Some(nurbs) = env.a5_by_pos.get(&pos) {
                         return Some((
                             SolvedSurfaceGeometry::Nurbs((*nurbs).clone()),
                             ConsolidatedCarrierChart::Identity,
                             matches!(face_surface, Some(SolvedSurfaceGeometry::Nurbs(_))),
                         ));
                     }
-                    if let Some(owned) =
-                        crate::families::a5a8::records::a5_owned_surfaces_from_records(
+                    if let Some(cached) = env.a5_multi_extent_cache.borrow().get(&pos) {
+                        return cached.clone().map(|nurbs| {
+                            (
+                                SolvedSurfaceGeometry::Nurbs(nurbs),
+                                ConsolidatedCarrierChart::Identity,
+                                matches!(face_surface, Some(SolvedSurfaceGeometry::Nurbs(_))),
+                            )
+                        });
+                    }
+                    let decoded =
+                        crate::families::a5a8::records::a5_owned_surface_from_record_in_sources(
                             env.data,
-                            std::slice::from_ref(support_rec),
+                            env.sources,
+                            support_rec,
                             refusal,
                         )
                         .ok()
-                        .and_then(|v| v.into_iter().next())
-                    {
-                        return Some((
-                            SolvedSurfaceGeometry::Nurbs(owned.geometry),
-                            ConsolidatedCarrierChart::Identity,
-                            matches!(face_surface, Some(SolvedSurfaceGeometry::Nurbs(_))),
-                        ));
-                    }
-                    if let Some(nurbs) = super::standard_carriers::decode_u32_nurbs_surface(
-                        env.data,
-                        env.sources,
-                        support_rec,
-                        refusal,
-                    ) {
+                        .flatten()
+                        .map(|owned| owned.geometry)
+                        .or_else(|| {
+                            super::standard_carriers::decode_u32_nurbs_surface(
+                                env.data,
+                                env.sources,
+                                support_rec,
+                                refusal,
+                            )
+                        });
+                    env.a5_multi_extent_cache
+                        .borrow_mut()
+                        .insert(pos, decoded.clone());
+                    if let Some(nurbs) = decoded {
                         return Some((
                             SolvedSurfaceGeometry::Nurbs(nurbs),
                             ConsolidatedCarrierChart::Identity,
@@ -901,17 +914,29 @@ fn line_curve(
     Ok(Some((cache, line, range)))
 }
 
-pub(in crate::families) fn attach(
+pub(in crate::families) struct WeightedEdgesSource<'a> {
+    pub(in crate::families) data: &'a [u8],
+    pub(in crate::families) sources: &'a [Vec<SourceExtent>],
+    pub(in crate::families) records: &'a [ConsolidatedRecord],
+    pub(in crate::families) journal: &'a AllocationJournal<'a>,
+    pub(in crate::families) owners: &'a OwnerClosureIndex,
+}
+
+pub(in crate::families) fn attach_with_journal(
     ir: &mut CadIr,
     annotations: &mut AnnotationBuilder<impl AnnotationStorage>,
-    data: &[u8],
-    sources: &[Vec<SourceExtent>],
-    records: &[ConsolidatedRecord],
+    source: &WeightedEdgesSource<'_>,
     freeform_surfaces: &[crate::families::a5a8::records::FreeformSurface],
     refusal: &mut crate::nurbs::LaneRefusals,
     admission: &mut FamilyEntityAdmission<'_, '_>,
 ) -> Result<AttachResult, CodecError> {
-    let journal = AllocationJournal::with_sources(data, sources, records);
+    let WeightedEdgesSource {
+        data,
+        sources,
+        records,
+        journal,
+        owners,
+    } = *source;
     let mut nodes = HashMap::new();
     let mut four_ref_nodes = HashMap::new();
     for (index, record) in records.iter().enumerate() {
@@ -940,7 +965,7 @@ pub(in crate::families) fn attach(
     if nodes.is_empty() && four_ref_nodes.is_empty() {
         return Ok(AttachResult::default());
     }
-    let owners = OwnerClosureIndex::new(data, records, &journal);
+    let a5_multi_extent_cache = std::cell::RefCell::new(HashMap::new());
     let mut jets = HashMap::new();
     for family in [ConsolidatedFamily::A, ConsolidatedFamily::B] {
         for jet in crate::wire::records::family_pcurves_from_records(data, records, family) {
@@ -1131,8 +1156,9 @@ pub(in crate::families) fn attach(
                         ir,
                         data,
                         sources,
-                        journal: &journal,
+                        journal,
                         a5_by_pos: &a5_by_pos,
+                        a5_multi_extent_cache: &a5_multi_extent_cache,
                         jets: &jets,
                         planes: &planes,
                         cylinders: &cylinders,
@@ -1234,8 +1260,9 @@ pub(in crate::families) fn attach(
                         ir,
                         data,
                         sources,
-                        journal: &journal,
+                        journal,
                         a5_by_pos: &a5_by_pos,
+                        a5_multi_extent_cache: &a5_multi_extent_cache,
                         jets: &jets,
                         planes: &planes,
                         cylinders: &cylinders,
@@ -1339,10 +1366,7 @@ pub(in crate::families) fn attach(
                 if carrier.family() != ConsolidatedFamily::A || carrier.class() != 0x34 {
                     continue;
                 }
-                let Some(surface) = freeform_surfaces
-                    .iter()
-                    .find(|s| s.pos == carrier.byte_offset())
-                else {
+                let Some(surface) = a5_by_pos.get(&carrier.byte_offset()) else {
                     continue;
                 };
                 let face_coedges: Vec<_> = edge_coedges
@@ -1361,7 +1385,7 @@ pub(in crate::families) fn attach(
                                     == Some(occurrence.face_tag)
                                     && s.geometry
                                         == SurfaceGeometry::Solved(SolvedSurfaceGeometry::Nurbs(
-                                            surface.geometry.clone(),
+                                            (*surface).clone(),
                                         ))
                             })
                     })
@@ -1391,7 +1415,7 @@ pub(in crate::families) fn attach(
                     refusal,
                     data,
                     line,
-                    &surface.geometry,
+                    surface,
                     range,
                     [
                         (start.position().get(), endpoint_tolerances[0]),
@@ -1724,8 +1748,9 @@ pub(in crate::families) fn attach(
                     ir,
                     data,
                     sources,
-                    journal: &journal,
+                    journal,
                     a5_by_pos: &a5_by_pos,
+                    a5_multi_extent_cache: &a5_multi_extent_cache,
                     jets: &jets,
                     planes: &planes,
                     cylinders: &cylinders,

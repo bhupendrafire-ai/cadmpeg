@@ -2079,6 +2079,11 @@ fn try_decode_standard_population(
         Ok(records) => records,
         Err(error) => return Some(Err(error)),
     };
+    let shared_journal = crate::families::consolidated::allocation::AllocationJournal::with_sources(
+        &scan.data,
+        &sources,
+        &consolidated_records,
+    );
     let vertex_points = match edge_table_form {
         EdgeTableForm::FbbOnly => fbb::fbb_only_vertex_points(standard_spine),
         EdgeTableForm::Standard => match fbb::standard_vertex_points(ctx, standard_spine) {
@@ -2200,6 +2205,7 @@ fn try_decode_standard_population(
         &scan.data,
         &sources,
         &consolidated_records,
+        &shared_journal,
         brep,
         &records,
         &mut plane_normals,
@@ -2737,10 +2743,11 @@ fn try_decode_standard_population(
     #[cfg(test)]
     let topology_budget = cadmpeg_core::decode::WorkBudget::new(crate::test_support::standard_topology_limit());
     let consolidated_edge_vertices =
-        crate::families::consolidated::allocation::consolidated_edge_vertex_references(
+        crate::families::consolidated::allocation::consolidated_edge_vertex_references_with_journal(
             &scan.data,
             &sources,
             &consolidated_records,
+            &shared_journal,
         );
     let topology_result = attach_standard_topology(ctx, crate::families::standard::decode::AttachStandardTopologyInputs { ir: &mut topology_ir, annotations: &mut topology_annotations, bindings: &face_bindings, records: &records, face_bounds: &face_bounds, spine: standard_spine, edge_table_form, brep, support_override: selection.map(|selection| selection.supports.as_slice()), source: &scan.data, e5_record_range: scan.e5_record_range.clone(), vertex_roster: vertex_roster.as_deref(), consolidated_edge_vertices: &consolidated_edge_vertices, native_edge_faces: &object_evidence.edge_owner_faces, native_edge_supports: &object_evidence.edge_supports, limit_curves: &object_evidence.limit_curves, work_budget: &topology_budget, diagnostics: &mut topology_diagnostics, bound_limit_curve_count: &mut bound_standard_limit_curve_count, refusal, admission: &mut admission })
     .and_then(|()| {
@@ -2893,9 +2900,12 @@ fn try_decode_standard_population(
             ctx,
             &mut ir,
             &mut annotations,
-            &scan.data,
-            &sources,
-            &consolidated_records,
+            &crate::families::freeform::standard_carriers::JournalSurfaceSource {
+                data: &scan.data,
+                sources: &sources,
+                records: &consolidated_records,
+                journal: &shared_journal,
+            },
             &a5_carriers,
             refusal,
         ) {
@@ -2920,12 +2930,21 @@ fn try_decode_standard_population(
             Err(error @ cadmpeg_core::CodecError::ResourceLimit(_)) => return Some(Err(error)),
             Err(_) => return None,
         };
-    let weighted = match crate::families::freeform::weighted_edges::attach(
+    let shared_owners = crate::families::consolidated::owner_closure::OwnerClosureIndex::new(
+        &scan.data,
+        &consolidated_records,
+        &shared_journal,
+    );
+    let weighted = match crate::families::freeform::weighted_edges::attach_with_journal(
         &mut ir,
         &mut annotations,
-        &scan.data,
-        &sources,
-        &consolidated_records,
+        &crate::families::freeform::weighted_edges::WeightedEdgesSource {
+            data: &scan.data,
+            sources: &sources,
+            records: &consolidated_records,
+            journal: &shared_journal,
+            owners: &shared_owners,
+        },
         &a5_carriers,
         refusal,
         &mut admission,
@@ -2946,19 +2965,23 @@ fn try_decode_standard_population(
     }
     consolidated_curve_bindings.standard_edges += weighted.edges;
     consolidated_curve_bindings.standard_face_pcurves += weighted.pcurves;
-    let source_jet_pcurves = match crate::families::freeform::owner_pcurves::attach_in_sources(
-        &mut ir,
-        &mut annotations,
-        &scan.data,
-        &sources,
-        &consolidated_records,
-        refusal,
-        &mut admission,
-    ) {
-        Ok(source_jet_pcurves) => source_jet_pcurves,
-        Err(error @ cadmpeg_core::CodecError::ResourceLimit(_)) => return Some(Err(error)),
-        Err(_) => return None,
-    };
+    let source_jet_pcurves =
+        match crate::families::freeform::owner_pcurves::attach_in_sources_with_journal(
+            &mut ir,
+            &mut annotations,
+            &crate::families::freeform::owner_pcurves::OwnerPcurvesSource {
+                data: &scan.data,
+                records: &consolidated_records,
+                journal: &shared_journal,
+                owners: &shared_owners,
+            },
+            refusal,
+            &mut admission,
+        ) {
+            Ok(source_jet_pcurves) => source_jet_pcurves,
+            Err(error @ cadmpeg_core::CodecError::ResourceLimit(_)) => return Some(Err(error)),
+            Err(_) => return None,
+        };
     consolidated_curve_bindings.standard_face_pcurves += source_jet_pcurves.pcurves;
     consolidated_curve_bindings.widened_vertices = weighted.widened_vertices;
     consolidated_curve_bindings.max_vertex_widening = weighted.max_vertex_widening;
